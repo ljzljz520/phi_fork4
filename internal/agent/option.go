@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"github.com/pulseaiclub/phi/internal/budget"
 	"github.com/pulseaiclub/phi/internal/extension"
 	"github.com/pulseaiclub/phi/internal/job"
 	llmclient "github.com/pulseaiclub/phi/internal/llm/client"
@@ -21,6 +22,7 @@ type engineConfig struct {
 	omitExtTools bool
 	mcp          *mcp.Pool
 	hooks        llmclient.Hooks
+	budget       *budget.Budget
 }
 
 // WithGate sets the permission gate (nil = allow all).
@@ -64,4 +66,10 @@ func WithMCP(pool *mcp.Pool) EngineOption {
 // WithHooks sets provider request interceptors (nil fields = no customization).
 func WithHooks(hooks llmclient.Hooks) EngineOption {
 	return func(c *engineConfig) { c.hooks = hooks }
+}
+
+// WithBudget attaches the shared per-session quota. nil leaves the engine
+// unguarded, which must keep the exact pre-budget behavior.
+func WithBudget(b *budget.Budget) EngineOption {
+	return func(c *engineConfig) { c.budget = b }
 }

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/pulseaiclub/phi/internal/budget"
 	"github.com/pulseaiclub/phi/internal/extension"
 	"github.com/pulseaiclub/phi/internal/job"
 	"github.com/pulseaiclub/phi/internal/llm"
@@ -35,6 +36,10 @@ type EngineRunner struct {
 	Tools        []tooldef.Tool                      // nil → SpecForRole(job.Role).Tools
 	Extensions   *extension.Runner
 	ExtensionsFn func() *extension.Runner
+	// BudgetFn resolves the parent session's shared quota. It is read once per
+	// Run, so a job keeps drawing from the budget active when it started even
+	// if the user switches sessions afterwards. nil disables child quotas.
+	BudgetFn func() *budget.Budget
 }
 
 // Run implements [job.Runner].
@@ -137,6 +142,11 @@ func (r EngineRunner) newEngine(meta job.Meta, spec ChildSpec, parentGate permis
 		extRunner = r.ExtensionsFn()
 	}
 
+	var sharedBudget *budget.Budget
+	if r.BudgetFn != nil {
+		sharedBudget = r.BudgetFn()
+	}
+
 	sess, err := NewSession(
 		WithCwd(cwd),
 		WithSessionDir(filepath.Join(meta.Dir, "session")),
@@ -152,5 +162,6 @@ func (r EngineRunner) newEngine(meta job.Meta, spec ChildSpec, parentGate permis
 		WithExtensions(extRunner),
 		WithOmitExtensionTools(true),
 		WithHooks(model.HooksForConfig(cfg)),
+		WithBudget(sharedBudget),
 	)
 }

@@ -18,6 +18,14 @@ type ConfigDoc struct {
 	SkillPath   *string    `yaml:"skill_path,omitempty"`
 	Permissions *PermDoc   `yaml:"permissions,omitempty"`
 	Agents      *AgentsDoc `yaml:"agents,omitempty"`
+	Budget      *BudgetDoc `yaml:"budget,omitempty"`
+}
+
+// BudgetDoc is the optional per-session shared quota block. Pointer fields
+// keep "key absent" distinct from an explicit zero (zero = unlimited).
+type BudgetDoc struct {
+	MaxRequests     *int `yaml:"max_requests,omitempty"`
+	MaxOutputTokens *int `yaml:"max_output_tokens,omitempty"`
 }
 
 // ModelDoc is one models[] entry.
@@ -159,6 +167,14 @@ func (d *ConfigDoc) Validate() error {
 			if strings.TrimSpace(m.APIKey) == "" {
 				return fmt.Errorf("default model %q is missing api_key", name)
 			}
+		}
+	}
+	if d.Budget != nil {
+		if d.Budget.MaxRequests != nil && *d.Budget.MaxRequests < 0 {
+			return errors.New("budget.max_requests must be non-negative (0 = unlimited)")
+		}
+		if d.Budget.MaxOutputTokens != nil && *d.Budget.MaxOutputTokens < 0 {
+			return errors.New("budget.max_output_tokens must be non-negative (0 = unlimited)")
 		}
 	}
 	if defaults > 1 {

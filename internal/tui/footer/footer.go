@@ -5,6 +5,7 @@ import (
 
 	"github.com/pulseaiclub/xui"
 
+	"github.com/pulseaiclub/phi/internal/budget"
 	"github.com/pulseaiclub/phi/internal/components"
 	"github.com/pulseaiclub/phi/internal/components/layout"
 	"github.com/pulseaiclub/phi/internal/session"
@@ -29,6 +30,8 @@ type StatusInput struct {
 	Spinner       flowSpinner
 	Usage         session.TokenUsage
 	ContextWindow int
+	// Budget is the active session quota snapshot, nil when unconfigured.
+	Budget *budget.Snapshot
 }
 
 type flowSpinner interface {
@@ -50,7 +53,7 @@ func StatusLabel(th components.Theme, input StatusInput) layout.BorderLabel {
 	if input.Activity != "" {
 		return activityStatusLabel(th, input.ShowSpinner, input.Spinner, input.Activity)
 	}
-	return tokenStatusLabel(th, input.Usage, input.ContextWindow)
+	return tokenStatusLabel(th, input.Usage, input.ContextWindow, input.Budget)
 }
 
 func activityStatusLabel(th components.Theme, showSpinner bool, spin flowSpinner, msg string) layout.BorderLabel {

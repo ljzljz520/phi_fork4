@@ -3,6 +3,7 @@ package controller
 import (
 	"time"
 
+	"github.com/pulseaiclub/phi/internal/budget"
 	"github.com/pulseaiclub/phi/internal/components/toast"
 	"github.com/pulseaiclub/phi/internal/job"
 	"github.com/pulseaiclub/phi/internal/permission"
@@ -43,9 +44,24 @@ type LoopFinishedMsg struct {
 	Gen       int
 	ErrorText string
 	Cancelled bool
+
+	// BudgetExhausted marks a quota refusal before dispatch (the loop error
+	// unwraps to budget.ErrExhausted). The completion dialog must not offer
+	// Retry in that state; BudgetSnapshot is the ledger view at completion.
+	BudgetExhausted bool
+	BudgetSnapshot  *budget.Snapshot
 }
 
 func (LoopFinishedMsg) isMsg() {}
+
+// BudgetMsg delivers a fresh quota snapshot from the active session's shared
+// budget. A nil Snapshot means the active session has no budget configured, so
+// footer renderers stay hidden.
+type BudgetMsg struct {
+	Snapshot *budget.Snapshot
+}
+
+func (BudgetMsg) isMsg() {}
 
 // FooterKind discriminates variants of FooterMsg.
 type FooterKind int
@@ -135,6 +151,8 @@ const (
 	OverlayExtConfirmDismiss
 	OverlayErrorAsk
 	OverlayErrorDismiss
+	OverlayBudgetAsk
+	OverlayBudgetDismiss
 )
 
 // OverlayMsg drives permission / extension-confirm / loop-error UI.
@@ -157,6 +175,10 @@ type OverlayMsg struct {
 
 	// Loop-error dialog
 	ErrorText string
+
+	// Budget-exhausted dialog (OverlayBudgetAsk): quota view rendered beside
+	// the error text. The dialog offers Copy/Dismiss only, never Retry.
+	BudgetSnapshot *budget.Snapshot
 }
 
 func (OverlayMsg) isMsg() {}

@@ -15,10 +15,20 @@ type CompactRequest struct {
 
 // CompactResult is the model's summary. Truncated reports that the provider
 // stopped at the output cap, so Text is a partial summary that must not be
-// persisted as a session checkpoint.
+// persisted as a session checkpoint. Usage carries provider-reported token
+// accounting when the non-streaming response includes it; a zero value means
+// the caller must treat consumption as unknown.
 type CompactResult struct {
 	Text      string
 	Truncated bool
+	Usage     Usage
+}
+
+// Reported says whether the provider attached real usage. A completion that
+// genuinely produced zero tokens cannot be distinguished from a missing
+// usage field, which is the intended conservative behavior.
+func (r CompactResult) UsageReported() bool {
+	return r.Usage.CompletionTokens > 0 || r.Usage.PromptTokens > 0 || r.Usage.TotalTokens > 0
 }
 
 // Compactor compresses conversation history into a concise summary.

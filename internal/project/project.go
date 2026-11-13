@@ -57,10 +57,24 @@ func (g GlobalLayout) SessionBase() string { return filepath.Join(g.root, "sessi
 // JobsDir returns the directory for sub-agent job artifacts.
 func (g GlobalLayout) JobsDir() string { return filepath.Join(g.root, "jobs") }
 
+// BudgetBase returns the root directory for per-session budget state.
+func (g GlobalLayout) BudgetBase() string { return filepath.Join(g.root, "budget") }
+
 // SessionDir returns the per-cwd session storage directory
 // (~/.phi/session/<encoded-cwd>/).
 func (p *Project) SessionDir() string {
 	return ProjectSessionDir(p.global.SessionBase(), p.root)
+}
+
+// BudgetDir returns the per-cwd budget state directory
+// (~/.phi/budget/<encoded-cwd>/), mirroring the session layout.
+func (p *Project) BudgetDir() string {
+	return ProjectSessionDir(p.global.BudgetBase(), p.root)
+}
+
+// BudgetFile returns the budget state file for one main session.
+func (p *Project) BudgetFile(sessionID string) string {
+	return filepath.Join(p.BudgetDir(), sessionID+".budget.json")
 }
 
 // JobsDir returns ~/.phi/jobs for sub-agent job artifacts.
@@ -109,7 +123,9 @@ func (p *Project) LoadConfig() error {
 }
 
 // ensureGlobalDirs creates the global phi home directories. It is what makes
-// ~/.phi/{bin,skills,extensions,session,jobs} exist from the very first startup.
+// ~/.phi/{bin,skills,extensions,session,jobs} exist from the very first
+// startup. The budget tree is created lazily on first SaveState so sessions
+// without a quota configured leave no budget artifacts behind.
 func ensureGlobalDirs(global GlobalLayout) error {
 	dirs := []string{
 		global.Root(),

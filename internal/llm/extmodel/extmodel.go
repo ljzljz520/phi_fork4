@@ -137,10 +137,16 @@ func (c *Client) Compact(ctx context.Context, req llm.CompactRequest) (llm.Compa
 	if err != nil {
 		return llm.CompactResult{}, err
 	}
-	var text strings.Builder
+	var (
+		text strings.Builder
+		acc  streamAccumulator
+	)
 	for ev, ferr := range frames {
 		if ferr != nil {
 			return llm.CompactResult{}, ferr
+		}
+		if uerr := acc.applyUsage(ev); uerr != nil {
+			return llm.CompactResult{}, uerr
 		}
 		switch ev.Type {
 		case "delta":
@@ -152,7 +158,7 @@ func (c *Client) Compact(ctx context.Context, req llm.CompactRequest) (llm.Compa
 			}
 			return llm.CompactResult{}, errors.New(msg)
 		case "done":
-			return llm.CompactResult{Text: text.String()}, nil
+			return llm.CompactResult{Text: text.String(), Usage: acc.usage}, nil
 		}
 	}
 	return llm.CompactResult{}, errors.New("extension model compaction closed without done")

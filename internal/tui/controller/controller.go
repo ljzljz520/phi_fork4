@@ -14,6 +14,7 @@ import (
 
 	ext "github.com/pulseaiclub/phi/ext/go"
 	"github.com/pulseaiclub/phi/internal/agent"
+	"github.com/pulseaiclub/phi/internal/budget"
 	"github.com/pulseaiclub/phi/internal/components/toast"
 	"github.com/pulseaiclub/phi/internal/debuglog"
 	"github.com/pulseaiclub/phi/internal/extension"
@@ -59,8 +60,16 @@ type EngineController struct {
 	extRunner     atomic.Pointer[extension.Runner]
 	mcpPool       *mcp.Pool
 
+	// budget is the active main-session quota shared with child jobs. nil when
+	// unconfigured; replaced on new/resume/fork, never on model switch.
+	budget atomic.Pointer[budget.Budget]
+
 	lastJobProgress sync.Map // progressSlot → progressSig
 }
+
+// budgetForChildren is the live getter handed to the process-level job
+// manager so spawned sub-agents always draw from the active session quota.
+func (c *EngineController) budgetForChildren() *budget.Budget { return c.budget.Load() }
 
 // NewController returns a live EngineController. proj must be non-nil.
 // Failure returns (nil, err), never a half-initialized value.
@@ -98,7 +107,7 @@ func NewController(bus *Bus, proj *project.Project) (*EngineController, error) {
 	c.extRunner.Store(extRunner)
 	c.bindExtensionHost(extRunner)
 
-	jobs, err := agent.NewJobManager(proj.JobsDir(), c.modelCfg, c.modelForRole, c.Extensions)
+	jobs, err := agent.NewJobManager(proj.JobsDir(), c.modelCfg, c.modelForRole, c.Extensions, c.budgetForChildren)
 	if err != nil {
 		return nil, err
 	}
@@ -630,12 +639,18 @@ func (c *EngineController) ForkSession() (string, error) {
 		c.discardFork(forked.ID())
 		return "", err
 	}
-	eng, err := c.newEngine(cfg, c.Extensions(), forked)
+	b, err := c.openBudget(forked.ID())
+	if err != nil {
+		c.discardFork(forked.ID())
+		return "", err
+	}
+	eng, err := c.newEngine(cfg, c.Extensions(), forked, b)
 	if err != nil {
 		c.discardFork(forked.ID())
 		return "", err
 	}
 	c.commitSessionSwitch("fork", prevID, forked.ID())
+	c.attachBudget(b)
 	c.activateSession(eng, cfg, "fork", prevID)
 	return forked.ID(), nil
 }
@@ -718,20 +733,68 @@ func (c *EngineController) openEngine(
 			return nil, llm.ModelConfig{}, fmt.Errorf("restore session model %q: %w", name, err)
 		}
 	}
-	eng, err := c.newEngine(cfg, extRunner, sess)
+	b, err := c.openBudget(sess.ID())
 	if err != nil {
 		return nil, llm.ModelConfig{}, err
 	}
+	eng, err := c.newEngine(cfg, extRunner, sess, b)
+	if err != nil {
+		return nil, llm.ModelConfig{}, err
+	}
+	c.attachBudget(b)
 	return eng, cfg, nil
 }
 
+// openBudget loads or creates the shared quota for the session identified by
+// sessionID. A config without a budget block returns nil, leaving the engine
+// unguarded with zero wrapper overhead. State is keyed by session id, so
+// resuming restores accumulated usage while a new/forked session starts fresh.
+func (c *EngineController) openBudget(sessionID string) (*budget.Budget, error) {
+	limits := c.proj.Config().Budget.Limits()
+	if !limits.Enabled() {
+		return nil, nil
+	}
+	path := c.proj.BudgetFile(sessionID)
+	b, err := budget.OpenOrCreate(path, sessionID, limits)
+	if err != nil {
+		return nil, fmt.Errorf("open budget state for session %s: %w", sessionID, err)
+	}
+	budget.BindPersistence(b, path, sessionID, func(err error) {
+		debuglog.Logf("budget: persist session %s: %v", sessionID, err)
+	})
+	b.OnChange(func(snap budget.Snapshot) {
+		// In-flight child jobs keep settling the budget they started on after
+		// a session switch; their snapshots must not overwrite the active one.
+		if c.budget.Load() != b {
+			return
+		}
+		s := snap
+		c.publish(BudgetMsg{Snapshot: &s})
+	})
+	return b, nil
+}
+
+// attachBudget installs b as the active session quota and announces its
+// initial snapshot. A nil budget clears the quota display on session switch.
+func (c *EngineController) attachBudget(b *budget.Budget) {
+	c.budget.Store(b)
+	if b == nil {
+		c.publish(BudgetMsg{})
+		return
+	}
+	snap := b.Snapshot()
+	c.publish(BudgetMsg{Snapshot: &snap})
+}
+
 // newEngine binds a session to a fresh engine on the controller-wide gate,
-// jobs, extensions, MCP pool and hooks. Every session switch funnels through
-// here, so a forked session runs on exactly the wiring of a resumed one.
+// jobs, extensions, MCP pool, hooks and shared budget. Every session switch
+// funnels through here, so a forked session runs on exactly the wiring of a
+// resumed one.
 func (c *EngineController) newEngine(
 	cfg llm.ModelConfig,
 	extRunner *extension.Runner,
 	sess *agent.Session,
+	b *budget.Budget,
 ) (*agent.Engine, error) {
 	return agent.NewEngine(cfg, sess,
 		agent.WithGate(c.gate),
@@ -740,6 +803,7 @@ func (c *EngineController) newEngine(
 		agent.WithExtensions(extRunner),
 		agent.WithMCP(c.mcpPool),
 		agent.WithHooks(model.HooksForConfig(cfg)),
+		agent.WithBudget(b),
 	)
 }
 
@@ -888,9 +952,29 @@ func (c *EngineController) finishLoop(ctx context.Context, gen int, err error) {
 	if err != nil && !cancelled {
 		errText = err.Error()
 	}
-	c.retryReady = errText != ""
+	// Quota refusal is terminal for this turn, not a transient provider error:
+	// a retry would hit the same empty ledger, so the dialog offers no Retry.
+	exhausted := errors.Is(err, budget.ErrExhausted)
+	if exhausted {
+		c.retryReady = false
+	} else {
+		c.retryReady = errText != ""
+	}
 	c.streamMu.Unlock()
-	c.publish(LoopFinishedMsg{Gen: gen, ErrorText: errText, Cancelled: cancelled})
+
+	finished := LoopFinishedMsg{
+		Gen:             gen,
+		ErrorText:       errText,
+		Cancelled:       cancelled,
+		BudgetExhausted: exhausted,
+	}
+	if exhausted {
+		if b := c.budget.Load(); b != nil {
+			snap := b.Snapshot()
+			finished.BudgetSnapshot = &snap
+		}
+	}
+	c.publish(finished)
 }
 
 func (c *EngineController) runLoop(ctx context.Context, gen int, engine *agent.Engine, prompt LastPrompt, resume bool) {

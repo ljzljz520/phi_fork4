@@ -6,10 +6,15 @@ import (
 
 	"github.com/pulseaiclub/xui"
 
+	"github.com/pulseaiclub/phi/internal/budget"
 	"github.com/pulseaiclub/phi/internal/components"
 	"github.com/pulseaiclub/phi/internal/components/layout"
 	"github.com/pulseaiclub/phi/internal/session"
 )
+
+// budgetWarnRatio is the used/limit share (including in-flight holds) at
+// which the quota label escalates from ambient to warning color.
+const budgetWarnRatio = 0.9
 
 // contextFillLevel ranks context-window pressure for the fill label.
 type contextFillLevel int
@@ -133,29 +138,115 @@ func contextPressureStyle(th components.Theme, usage session.TokenUsage, window 
 	}
 }
 
+// formatBudgetLabel builds the quota fragment, e.g.
+// "budget 12/500 req · ↓45.0k/200k". Unlimited dimensions are omitted, so a
+// requests-only budget renders "budget 12/500 req"; a nil snapshot renders
+// nothing and keeps the footer unchanged for unconfigured sessions.
+func formatBudgetLabel(snap *budget.Snapshot) string {
+	if snap == nil {
+		return ""
+	}
+	var parts []string
+	if snap.Limits.MaxRequests > 0 {
+		used := snap.SettledRequests + snap.ReservedRequests
+		parts = append(parts, fmt.Sprintf("%d/%d req", used, snap.Limits.MaxRequests))
+	}
+	if snap.Limits.MaxOutputTokens > 0 {
+		used := snap.SettledOutputTokens + snap.ReservedOutputTokens
+		parts = append(parts, fmt.Sprintf(
+			"↓%s/%s",
+			components.FormatTokens(int(used)),
+			components.FormatTokens(snap.Limits.MaxOutputTokens),
+		))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "budget " + strings.Join(parts, " · ")
+}
+
+// budgetPressureStyle colors the quota fragment: destructive once refused,
+// warning at >=90% of either cap, ambient otherwise.
+func budgetPressureStyle(th components.Theme, snap *budget.Snapshot) xui.Style {
+	if snap == nil {
+		return ChromeLabelStyle(th)
+	}
+	if snap.Exhausted {
+		return th.Destructive
+	}
+	maxRatio := 0.0
+	if snap.Limits.MaxRequests > 0 {
+		maxRatio = max(
+			maxRatio,
+			float64(snap.SettledRequests+snap.ReservedRequests)/float64(snap.Limits.MaxRequests),
+		)
+	}
+	if snap.Limits.MaxOutputTokens > 0 {
+		maxRatio = max(
+			maxRatio,
+			float64(snap.SettledOutputTokens+snap.ReservedOutputTokens)/float64(snap.Limits.MaxOutputTokens),
+		)
+	}
+	if maxRatio >= budgetWarnRatio {
+		return th.Warning
+	}
+	return ChromeLabelStyle(th)
+}
+
 // tokenStatusLabel builds the idle bottom-left label: usage always ambient,
-// context % escalates alone when the window is under pressure.
-func tokenStatusLabel(th components.Theme, usage session.TokenUsage, window int) layout.BorderLabel {
+// context % escalates alone when the window is under pressure, and the quota
+// fragment escalates independently.
+func tokenStatusLabel(
+	th components.Theme,
+	usage session.TokenUsage,
+	window int,
+	budgetSnap *budget.Snapshot,
+) layout.BorderLabel {
 	stats := formatUsageStats(usage)
 	ctx := formatContextLabel(usage, window)
-	chrome := ChromeLabelStyle(th)
-	if stats == "" && ctx == "" {
+	quota := formatBudgetLabel(budgetSnap)
+	if stats == "" && ctx == "" && quota == "" {
 		return layout.BorderLabel{}
 	}
-	if ctx == "" {
-		return layout.BorderLabel{Text: stats, Style: chrome}
+
+	var spans []layout.BorderSpan
+	add := func(text string, style xui.Style) {
+		if text == "" {
+			return
+		}
+		if len(spans) > 0 {
+			text = " " + text
+		}
+		spans = append(spans, layout.BorderSpan{Text: text, Style: style})
 	}
-	pressure := contextPressureStyle(th, usage, window)
-	if stats == "" {
-		return layout.BorderLabel{Text: ctx, Style: pressure}
+
+	chrome := ChromeLabelStyle(th)
+	add(stats, chrome)
+	if ctx != "" {
+		add(ctx, contextPressureStyle(th, usage, window))
 	}
-	if contextFillLevelFor(contextFillRatio(usage.ContextTokens(), window), window) <= contextFillRecommend {
-		return layout.BorderLabel{Text: joinBorderParts(stats, ctx), Style: chrome}
+	add(quota, budgetPressureStyle(th, budgetSnap))
+
+	if len(spans) == 1 {
+		return layout.BorderLabel{Text: spans[0].Text, Style: spans[0].Style}
 	}
-	return layout.BorderLabel{Spans: []layout.BorderSpan{
-		{Text: stats + " ", Style: chrome},
-		{Text: ctx, Style: pressure},
-	}}
+	// Ambient-only content keeps the legacy single-text label; spans exist
+	// only when at least one fragment escalates to its own color.
+	allAmbient := true
+	for _, span := range spans {
+		if span.Style != chrome {
+			allAmbient = false
+			break
+		}
+	}
+	if allAmbient {
+		parts := make([]string, len(spans))
+		for i, span := range spans {
+			parts[i] = span.Text
+		}
+		return layout.BorderLabel{Text: strings.Join(parts, ""), Style: chrome}
+	}
+	return layout.BorderLabel{Spans: spans}
 }
 
 // joinBorderParts concatenates non-empty label fragments with a single space.

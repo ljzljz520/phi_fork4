@@ -658,7 +658,8 @@ func CompactRequest(
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
-		StopReason string `json:"stop_reason"`
+		StopReason string      `json:"stop_reason"`
+		Usage      streamUsage `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return llm.CompactResult{}, err
@@ -673,10 +674,17 @@ func CompactRequest(
 	if sb.Len() == 0 {
 		return llm.CompactResult{}, errors.New("anthropic API error: empty response")
 	}
-	return llm.CompactResult{
+	result := llm.CompactResult{
 		Text:      sb.String(),
 		Truncated: resp.StopReason == stopReasonMaxTokens,
-	}, nil
+	}
+	var usage llm.Usage
+	resp.Usage.apply(&usage)
+	if usage.CompletionTokens > 0 || usage.PromptTokens > 0 {
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens + usage.CachedTokens() + usage.CacheWriteTokens()
+		result.Usage = usage
+	}
+	return result, nil
 }
 
 func marshalRequest(req *AnthropicRequest, cfg llm.ModelConfig) ([]byte, error) {

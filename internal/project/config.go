@@ -1,12 +1,14 @@
 package project
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/pulseaiclub/phi/internal/budget"
 	"github.com/pulseaiclub/phi/internal/llm"
 	"github.com/pulseaiclub/phi/internal/permission"
 	"github.com/pulseaiclub/phi/internal/project/model"
@@ -26,6 +28,38 @@ type Config struct {
 	SkillPaths  []string
 	Permissions permission.Policy
 	Agents      AgentsConfig
+	Budget      BudgetConfig
+}
+
+// BudgetConfig is the optional shared per-session quota. Zero values mean
+// that dimension is unlimited, so the zero struct disables the budget.
+type BudgetConfig struct {
+	MaxRequests     int
+	MaxOutputTokens int
+}
+
+// Limits converts the config into budget limits, applying CLI overrides
+// (non-negative values replace the file setting; a negative override is
+// treated as "not provided" by the caller).
+func (b BudgetConfig) Limits(overrides ...BudgetConfig) budget.Limits {
+	effective := b
+	for _, o := range overrides {
+		if o.MaxRequests >= 0 {
+			effective.MaxRequests = o.MaxRequests
+		}
+		if o.MaxOutputTokens >= 0 {
+			effective.MaxOutputTokens = o.MaxOutputTokens
+		}
+	}
+	return budget.Limits{
+		MaxRequests:     effective.MaxRequests,
+		MaxOutputTokens: effective.MaxOutputTokens,
+	}
+}
+
+// Enabled reports whether at least one dimension is capped.
+func (b BudgetConfig) Enabled() bool {
+	return b.MaxRequests > 0 || b.MaxOutputTokens > 0
 }
 
 // AgentsConfig controls whether the main agent may spawn sub-agents
@@ -174,6 +208,20 @@ func parseConfigFileWithEnv(path string, withEnv bool) (*Config, error) {
 				Review:  strings.TrimSpace(raw.Agents.Models.Review),
 				Worker:  strings.TrimSpace(raw.Agents.Models.Worker),
 			}
+		}
+	}
+	if raw.Budget != nil {
+		if raw.Budget.MaxRequests != nil {
+			if *raw.Budget.MaxRequests < 0 {
+				return nil, errors.New("budget.max_requests must be non-negative (0 = unlimited)")
+			}
+			cfg.Budget.MaxRequests = *raw.Budget.MaxRequests
+		}
+		if raw.Budget.MaxOutputTokens != nil {
+			if *raw.Budget.MaxOutputTokens < 0 {
+				return nil, errors.New("budget.max_output_tokens must be non-negative (0 = unlimited)")
+			}
+			cfg.Budget.MaxOutputTokens = *raw.Budget.MaxOutputTokens
 		}
 	}
 	return cfg, nil

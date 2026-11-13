@@ -337,6 +337,14 @@ func Stream(
 	}
 }
 
+type usageMetadata struct {
+	PromptTokenCount        int `json:"promptTokenCount"`
+	CandidatesTokenCount    int `json:"candidatesTokenCount"`
+	CachedContentTokenCount int `json:"cachedContentTokenCount"`
+	ThoughtsTokenCount      int `json:"thoughtsTokenCount"`
+	TotalTokenCount         int `json:"totalTokenCount"`
+}
+
 type chunk struct {
 	Candidates []struct {
 		Content struct {
@@ -345,13 +353,25 @@ type chunk struct {
 		FinishReason string `json:"finishReason"`
 	} `json:"candidates"`
 
-	UsageMetadata struct {
-		PromptTokenCount        int `json:"promptTokenCount"`
-		CandidatesTokenCount    int `json:"candidatesTokenCount"`
-		CachedContentTokenCount int `json:"cachedContentTokenCount"`
-		ThoughtsTokenCount      int `json:"thoughtsTokenCount"`
-		TotalTokenCount         int `json:"totalTokenCount"`
-	} `json:"usageMetadata"`
+	UsageMetadata usageMetadata `json:"usageMetadata"`
+}
+
+// normalizeUsage splits Gemini's metadata into the shared disjoint buckets.
+// promptTokenCount includes cached content, so the cached part is subtracted
+// to leave the uncached bucket; Gemini bills no separate cache write.
+func normalizeUsage(u usageMetadata) llm.Usage {
+	if u.TotalTokenCount == 0 && u.PromptTokenCount == 0 {
+		return llm.Usage{}
+	}
+	usage := llm.Usage{
+		PromptTokens:     max(u.PromptTokenCount-u.CachedContentTokenCount, 0),
+		CompletionTokens: u.CandidatesTokenCount + u.ThoughtsTokenCount,
+		TotalTokens:      u.TotalTokenCount,
+	}
+	if u.CachedContentTokenCount > 0 {
+		usage.PromptTokensDetails = &llm.PromptTokensDetails{CachedTokens: u.CachedContentTokenCount}
+	}
+	return usage
 }
 
 func processStream(body io.Reader, yield func(llm.StreamEvent, error) bool) {
@@ -376,17 +396,8 @@ func processStream(body io.Reader, yield func(llm.StreamEvent, error) bool) {
 			continue
 		}
 
-		u := ck.UsageMetadata
-		if u.TotalTokenCount > 0 || u.PromptTokenCount > 0 {
-			// promptTokenCount includes the cached content, so the cached part is
-			// subtracted to leave the uncached bucket. Gemini bills no separate
-			// cache write, so that bucket stays empty.
-			usage.PromptTokens = max(u.PromptTokenCount-u.CachedContentTokenCount, 0)
-			usage.CompletionTokens = u.CandidatesTokenCount + u.ThoughtsTokenCount
-			usage.TotalTokens = u.TotalTokenCount
-			if u.CachedContentTokenCount > 0 {
-				usage.PromptTokensDetails = &llm.PromptTokensDetails{CachedTokens: u.CachedContentTokenCount}
-			}
+		if normalized := normalizeUsage(ck.UsageMetadata); normalized.TotalTokens > 0 || normalized.PromptTokens > 0 {
+			usage = normalized
 		}
 
 		for _, cand := range ck.Candidates {
@@ -477,5 +488,9 @@ func CompactRequest(
 	if b.Len() == 0 {
 		return llm.CompactResult{}, errors.New("gemini API error: empty response")
 	}
-	return llm.CompactResult{Text: b.String(), Truncated: truncated}, nil
+	return llm.CompactResult{
+		Text:      b.String(),
+		Truncated: truncated,
+		Usage:     normalizeUsage(resp.UsageMetadata),
+	}, nil
 }

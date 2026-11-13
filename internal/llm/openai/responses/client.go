@@ -65,7 +65,42 @@ func CompactRequest(
 	if text == "" {
 		return llm.CompactResult{}, errors.New("LLM API error: empty Responses output")
 	}
-	return llm.CompactResult{Text: text, Truncated: resp.truncated()}, nil
+	return llm.CompactResult{
+		Text:      text,
+		Truncated: resp.truncated(),
+		Usage:     resp.Usage.normalize(),
+	}, nil
+}
+
+// usageWire is the Responses API usage block, shared by streaming events and
+// non-streaming compaction responses.
+type usageWire struct {
+	InputTokens        int `json:"input_tokens"`
+	OutputTokens       int `json:"output_tokens"`
+	TotalTokens        int `json:"total_tokens"`
+	InputTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"input_tokens_details,omitempty"`
+}
+
+// normalize splits input_tokens into uncached prompt and cached buckets.
+func (u *usageWire) normalize() llm.Usage {
+	if u == nil || (u.InputTokens == 0 && u.OutputTokens == 0 && u.TotalTokens == 0) {
+		return llm.Usage{}
+	}
+	cached := 0
+	if u.InputTokensDetails != nil {
+		cached = u.InputTokensDetails.CachedTokens
+	}
+	usage := llm.Usage{
+		PromptTokens:     max(u.InputTokens-cached, 0),
+		CompletionTokens: u.OutputTokens,
+		TotalTokens:      u.TotalTokens,
+	}
+	if cached > 0 {
+		usage.PromptTokensDetails = &llm.PromptTokensDetails{CachedTokens: cached}
+	}
+	return usage
 }
 
 type compactResponse struct {
@@ -82,6 +117,7 @@ type compactResponse struct {
 			Text string `json:"text"`
 		} `json:"content"`
 	} `json:"output"`
+	Usage *usageWire `json:"usage,omitempty"`
 }
 
 // truncated reports whether the response stopped at the output cap.
@@ -146,14 +182,7 @@ type streamEvent struct {
 		Arguments string `json:"arguments,omitempty"`
 	} `json:"item,omitempty"`
 	Response *struct {
-		Usage *struct {
-			InputTokens        int `json:"input_tokens"`
-			OutputTokens       int `json:"output_tokens"`
-			TotalTokens        int `json:"total_tokens"`
-			InputTokensDetails *struct {
-				CachedTokens int `json:"cached_tokens"`
-			} `json:"input_tokens_details,omitempty"`
-		} `json:"usage,omitempty"`
+		Usage *usageWire `json:"usage,omitempty"`
 		Error *struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
@@ -302,20 +331,9 @@ func processStream(body io.Reader, yield func(llm.StreamEvent, error) bool) {
 
 		case "response.completed":
 			if ev.Response != nil && ev.Response.Usage != nil {
-				u := ev.Response.Usage
-				// input_tokens includes the cached input, so cached tokens are
-				// subtracted to leave the uncached bucket that the cache hit rate is
-				// read from.
-				cached := 0
-				if u.InputTokensDetails != nil {
-					cached = u.InputTokensDetails.CachedTokens
-				}
-				usage.PromptTokens = max(u.InputTokens-cached, 0)
-				usage.CompletionTokens = u.OutputTokens
-				usage.TotalTokens = u.TotalTokens
-				if cached > 0 {
-					usage.PromptTokensDetails = &llm.PromptTokensDetails{CachedTokens: cached}
-				}
+				// input_tokens includes the cached input; normalize splits the
+				// buckets so the cache hit rate readout stays consistent.
+				usage = ev.Response.Usage.normalize()
 			}
 
 		case "error":

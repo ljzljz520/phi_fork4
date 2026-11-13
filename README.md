@@ -210,9 +210,32 @@ permissions:
       resource: url
       decision: ask
       reason: external lookup needs approval
+
+budget:                   # optional shared quota for one session; omit to disable
+  max_requests: 500       # cap on model requests (main agent + sub-agents + compaction + retries)
+  max_output_tokens: 200000  # cap on settled output tokens; either key may be omitted
 ```
 
 Built-in presets and thinking wire formats: [doc/models.md](doc/models.md).
+
+### Session budget
+
+The optional `budget:` block puts one shared quota on everything a session
+sends to the model: the main agent, concurrent sub-agents, compaction
+requests, and actual HTTP retries all draw from the same ledger. Quota is
+reserved atomically *before* a request goes out and settled against the
+provider's reported usage when it completes. When the provider omits usage,
+output that produced content is counted at the reserved estimate and output
+is released when nothing was produced (the request still counts).
+
+The ledger is persisted per session under `~/.phi/budget/`. Resuming a
+session continues the accumulated spend, forking or starting a session gets a
+fresh ledger, and switching models never resets either. Once a cap is reached
+the agent stops generating new requests but keeps the conversation, so you
+can still read the transcript and resume later. In the TUI the footer shows
+live usage (warning color past 90%) and exhaustion opens a dialog without a
+retry action; headless runs exit `2` and tag the JSONL error event with
+`"kind":"budget_exhausted"`.
 
 Environment overrides:
 
@@ -237,6 +260,7 @@ Provider routing uses the explicit `api` field (`OpenAI` / `Anthropic` /
 ├── skills/       # SKILL.md skill directories
 ├── extensions/   # PXB binaries + phi.yaml
 ├── jobs/         # sub-agent job artifacts (meta, logs, result.md)
+├── budget/       # per-session quota ledgers (<session-id>.budget.json)
 └── session/      # persisted sessions, one dir per working directory
     └── <encoded-cwd>/
 ```
@@ -392,12 +416,16 @@ Flags:
 | `--continue-last`    | Resume the newest persisted session for this directory |
 | `--session-dir DIR`  | Override the session storage directory         |
 | `--tools LIST`       | Enable only these comma-separated built-in tools |
+| `--max-requests N`   | Shared session cap on model requests (`0` = unlimited; overrides config) |
+| `--max-output-tokens N` | Shared session cap on settled output tokens (`0` = unlimited; overrides config) |
 
 `--tools` accepts built-in names such as `read,ls,grep`. MCP and agent tools
 still append when configured; the flag only scopes the built-in toolset.
 
-Exit codes: `0` success · `1` runtime/LLM error ·
-`3` config/usage error.
+Exit codes: `0` success · `1` runtime/LLM error · `2` budget exhausted ·
+`3` config/usage error. With `--jsonl`, a budget run emits a `budget` event at
+start and on exhaustion, and the error event carries
+`"kind":"budget_exhausted"` plus the final quota snapshot.
 
 In headless mode, permission `ask` decisions are denied (there is no approval
 UI), so `readonly`-style safety applies without extra flags. For benchmarks

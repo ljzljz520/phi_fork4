@@ -14,10 +14,12 @@ import (
 	"time"
 
 	"github.com/pulseaiclub/phi/internal/agent"
+	"github.com/pulseaiclub/phi/internal/budget"
 	"github.com/pulseaiclub/phi/internal/extension"
 	"github.com/pulseaiclub/phi/internal/job"
 	"github.com/pulseaiclub/phi/internal/llm"
 	"github.com/pulseaiclub/phi/internal/mcp"
+	"github.com/pulseaiclub/phi/internal/project"
 	"github.com/pulseaiclub/phi/internal/project/model"
 	"github.com/pulseaiclub/phi/internal/session"
 	"github.com/pulseaiclub/phi/internal/tools"
@@ -35,6 +37,10 @@ type runOptions struct {
 	continueLast bool
 	sessionDir   string
 	builtinTools string // raw --tools value; empty means all default tools
+	// -1 means the flag was not provided, so config budget limits apply;
+	// 0 explicitly means unlimited.
+	maxRequests     int
+	maxOutputTokens int
 }
 
 // runHeadless runs one agent loop and returns an exitError (or nil) for main.
@@ -83,6 +89,14 @@ func runHeadless(opts runOptions) error {
 		mcpPool = pool
 		defer func() { _ = pool.Close() }()
 	}
+	// One ledger per resumed/new session. Sub-agent jobs capture the variable
+	// and see the instance once it is opened below, before any loop starts.
+	limits := bs.Config.Budget.Limits(project.BudgetConfig{
+		MaxRequests:     opts.maxRequests,
+		MaxOutputTokens: opts.maxOutputTokens,
+	})
+	var b *budget.Budget
+
 	engineOpts := []agent.EngineOption{
 		agent.WithGate(bs.Gate),
 		agent.WithExtensions(extRunner),
@@ -119,6 +133,8 @@ func runHeadless(opts runOptions) error {
 			return parent
 		}, func() *extension.Runner {
 			return extRunner
+		}, func() *budget.Budget {
+			return b
 		})
 		if jobErr != nil {
 			fmt.Fprintln(os.Stderr, "phi run:", jobErr)
@@ -143,6 +159,19 @@ func runHeadless(opts runOptions) error {
 		fmt.Fprintln(os.Stderr, "phi run:", err)
 		return exitCode(ExitUsage)
 	}
+
+	if limits.Enabled() {
+		budgetPath := bs.Proj.BudgetFile(sess.ID())
+		b, err = budget.OpenOrCreate(budgetPath, sess.ID(), limits)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "phi run:", err)
+			return exitCode(ExitError)
+		}
+		budget.BindPersistence(b, budgetPath, sess.ID(), func(err error) {
+			fmt.Fprintln(os.Stderr, "warning: budget state:", err)
+		})
+	}
+	engineOpts = append(engineOpts, agent.WithBudget(b))
 
 	engine, err := agent.NewEngine(bs.Config.Model(), sess, engineOpts...)
 	if err != nil {
@@ -188,16 +217,39 @@ func loadRunExtensions(bs *runBootstrap) *extension.Runner {
 // runLoop consumes the same engine.Loop the TUI uses — no second loop is
 // implemented here — and maps events to stdout/stderr + exit codes.
 func runLoop(ctx context.Context, engine *agent.Engine, opts runOptions) int {
-	enc := &jsonlEncoder{out: os.Stdout, enabled: opts.jsonl}
+	return runLoopWithEncoder(ctx, engine, opts, &jsonlEncoder{out: os.Stdout, enabled: opts.jsonl})
+}
+
+// runLoopWithEncoder is the testable core: callers supply the JSONL sink so
+// machine-readable output can be asserted without touching os.Stdout.
+func runLoopWithEncoder(
+	ctx context.Context,
+	engine *agent.Engine,
+	opts runOptions,
+	enc *jsonlEncoder,
+) int {
+	if b := engine.Budget(); b != nil {
+		enc.budgetEvent("ready", "", b.Snapshot())
+	}
 
 	exit := ExitOK
 	finalText := ""
 
 	for ev, err := range engine.Loop(ctx, opts.prompt, agent.LoopOpts{}) {
 		if err != nil {
-			exit = ExitError
-			enc.errorEvent(err.Error())
-			fmt.Fprintln(os.Stderr, "error:", err)
+			if errors.Is(err, budget.ErrExhausted) {
+				// Distinct from a runtime failure: the conversation remains
+				// resumable, only new generation is refused.
+				exit = ExitBudget
+				snap, dimension := budgetErrorView(err, engine.Budget())
+				enc.budgetEvent("exhausted", dimension, snap)
+				enc.budgetErrorEvent(err.Error(), snap)
+				fmt.Fprintln(os.Stderr, "budget exhausted:", err)
+			} else {
+				exit = ExitError
+				enc.errorEvent(err.Error())
+				fmt.Fprintln(os.Stderr, "error:", err)
+			}
 			break
 		}
 		if ev == nil {
@@ -344,8 +396,31 @@ type jsonlCompaction struct {
 }
 
 type jsonlError struct {
-	Type    string `json:"type"` // "error"
-	Message string `json:"message"`
+	Type    string               `json:"type"` // "error"
+	Kind    string               `json:"kind,omitempty"`
+	Message string               `json:"message"`
+	Budget  *jsonlBudgetSnapshot `json:"budget,omitempty"`
+}
+
+// jsonlBudgetCounters mirrors one quota dimension. Limit 0 means unlimited,
+// matching budget.Limits; reserved counts in-flight holds against the cap.
+type jsonlBudgetCounters struct {
+	Settled  int64 `json:"settled"`
+	Reserved int64 `json:"reserved"`
+	Limit    int   `json:"limit"`
+}
+
+type jsonlBudgetSnapshot struct {
+	Requests     jsonlBudgetCounters `json:"requests"`
+	OutputTokens jsonlBudgetCounters `json:"outputTokens"`
+	Exhausted    bool                `json:"exhausted"`
+}
+
+type jsonlBudget struct {
+	Type      string              `json:"type"`                // "budget"
+	Phase     string              `json:"phase"`               // "ready" | "exhausted"
+	Dimension string              `json:"dimension,omitempty"` // requests | output_tokens
+	Snapshot  jsonlBudgetSnapshot `json:"snapshot"`
 }
 
 type jsonlDone struct {
@@ -397,6 +472,53 @@ func (enc *jsonlEncoder) event(ev session.Event) {
 
 func (enc *jsonlEncoder) errorEvent(message string) {
 	enc.emit(jsonlError{Type: "error", Message: message})
+}
+
+// budgetErrorEvent marks the error event as quota refusal so headless
+// consumers can distinguish it from ordinary runtime failures without
+// string-matching the message.
+func (enc *jsonlEncoder) budgetErrorEvent(message string, snap budget.Snapshot) {
+	wire := budgetWireSnapshot(snap)
+	enc.emit(jsonlError{Type: "error", Kind: "budget_exhausted", Message: message, Budget: &wire})
+}
+
+func (enc *jsonlEncoder) budgetEvent(phase, dimension string, snap budget.Snapshot) {
+	enc.emit(jsonlBudget{
+		Type:      "budget",
+		Phase:     phase,
+		Dimension: dimension,
+		Snapshot:  budgetWireSnapshot(snap),
+	})
+}
+
+func budgetWireSnapshot(snap budget.Snapshot) jsonlBudgetSnapshot {
+	return jsonlBudgetSnapshot{
+		Requests: jsonlBudgetCounters{
+			Settled:  snap.SettledRequests,
+			Reserved: snap.ReservedRequests,
+			Limit:    snap.Limits.MaxRequests,
+		},
+		OutputTokens: jsonlBudgetCounters{
+			Settled:  snap.SettledOutputTokens,
+			Reserved: snap.ReservedOutputTokens,
+			Limit:    snap.Limits.MaxOutputTokens,
+		},
+		Exhausted: snap.Exhausted,
+	}
+}
+
+// budgetErrorView pulls the refusal dimension and point-of-refusal snapshot
+// from the typed error, falling back to the live ledger when it was wrapped
+// beyond errors.As reach.
+func budgetErrorView(err error, b *budget.Budget) (budget.Snapshot, string) {
+	var exhausted *budget.ExhaustedError
+	if errors.As(err, &exhausted) {
+		return exhausted.Snapshot, string(exhausted.Dimension)
+	}
+	if b != nil {
+		return b.Snapshot(), ""
+	}
+	return budget.Snapshot{}, ""
 }
 
 func (enc *jsonlEncoder) doneEvent(sessionID, file string, exit int) {

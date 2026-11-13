@@ -137,7 +137,9 @@ func TestCompactRequest(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(
 			[]byte(
-				`{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"summary"}]}]}`,
+				`{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"summary"}]}],` +
+					`"usage":{"input_tokens":10,"output_tokens":7,"total_tokens":17,` +
+					`"input_tokens_details":{"cached_tokens":2}}}`,
 			),
 		)
 	}))
@@ -149,6 +151,28 @@ func TestCompactRequest(t *testing.T) {
 	assert.Equal(t, "summary", res.Text)
 	assert.False(t, res.Truncated)
 	assert.Equal(t, 13107, gotMaxOutputTokens)
+	assert.True(t, res.UsageReported())
+	assert.Equal(t, 7, res.Usage.CompletionTokens)
+	assert.Equal(t, 8, res.Usage.PromptTokens, "uncached input (10 - 2 cached)")
+	assert.Equal(t, 2, res.Usage.CachedTokens())
+	assert.Equal(t, 17, res.Usage.TotalTokens)
+}
+
+func TestCompactRequestWithoutUsageStaysZero(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(
+			[]byte(
+				`{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"summary"}]}]}`,
+			),
+		)
+	}))
+	defer srv.Close()
+
+	cfg := llm.ModelConfig{Name: "gpt-5", BaseURL: srv.URL, APIKey: "sk"}
+	res, err := CompactRequest(t.Context(), srv.Client(), cfg, NewCompactRequest(cfg, "sum", 10))
+	require.NoError(t, err)
+	assert.False(t, res.UsageReported(), "missing usage must stay a zero value")
 }
 
 // status incomplete with reason max_output_tokens means the answer is a prefix.

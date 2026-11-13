@@ -321,6 +321,32 @@ func TestCompactUsesNonStreamingEndpoint(t *testing.T) {
 	assert.Equal(t, map[string]int{"maxOutputTokens": 13107}, gotGenerationConfig)
 }
 
+func TestCompactRequestCarriesUsage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(
+			w,
+			`{"candidates":[{"content":{"parts":[{"text":"summary"}]},"finishReason":"STOP"}],`+
+				`"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":7,"cachedContentTokenCount":5,`+
+				`"thoughtsTokenCount":3,"totalTokenCount":22}}`,
+		)
+	}))
+	defer srv.Close()
+
+	res, err := CompactRequest(
+		t.Context(),
+		srv.Client(),
+		llm.ModelConfig{Name: "gemini-2.5-flash", BaseURL: srv.URL, APIKey: "k"},
+		&GeminiRequest{Contents: []content{{Role: "user", Parts: []part{{Text: "x"}}}}},
+	)
+	require.NoError(t, err)
+	assert.True(t, res.UsageReported())
+	assert.Equal(t, 10, res.Usage.CompletionTokens, "candidates 7 + thoughts 3")
+	assert.Equal(t, 7, res.Usage.PromptTokens, "uncached prompt (12 - 5 cached)")
+	assert.Equal(t, 5, res.Usage.CachedTokens())
+	assert.Equal(t, 22, res.Usage.TotalTokens)
+}
+
 // MAX_TOKENS means the model stopped at the cap: the text is a prefix.
 func TestCompactRequestReportsTruncatedCandidate(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

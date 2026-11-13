@@ -11,6 +11,7 @@ import (
 
 	"github.com/pulseaiclub/phi/ext/go/pxb"
 	"github.com/pulseaiclub/phi/internal/agent/prompt"
+	"github.com/pulseaiclub/phi/internal/budget"
 	"github.com/pulseaiclub/phi/internal/extension"
 	"github.com/pulseaiclub/phi/internal/job"
 	"github.com/pulseaiclub/phi/internal/llm"
@@ -41,6 +42,7 @@ type Engine struct {
 	baseTools    []tooldef.Tool    // nil = DefaultTools; preserved across rebind
 	omitExtTools bool              // sub-agents: emit events but skip RegisterTool merge
 	mcp          *mcp.Pool
+	budget       *budget.Budget // nil = unguarded; survives SetModel rebinds
 
 	session *Session
 }
@@ -64,6 +66,7 @@ func NewEngine(model llm.ModelConfig, sess *Session, opts ...EngineOption) (*Eng
 		extensions:   cfg.extensions,
 		omitExtTools: cfg.omitExtTools,
 		mcp:          cfg.mcp,
+		budget:       cfg.budget,
 	}
 	engine.baseTools = cfg.tools
 	engine.rebindTools()
@@ -77,6 +80,7 @@ func NewEngine(model llm.ModelConfig, sess *Session, opts ...EngineOption) (*Eng
 // never pass through a provider request builder.
 func (engine *Engine) newChatClient(tools []tooldef.Tool) llm.ChatClient {
 	defs := tooldef.Definitions(tools)
+	var inner llm.ChatClient
 	if route, ok := engine.extensions.LookupModel(engine.modelCfg.Name); ok && route.ExtConn() {
 		runner := engine.extensions
 		stream := func(
@@ -85,10 +89,17 @@ func (engine *Engine) newChatClient(tools []tooldef.Tool) llm.ChatClient {
 		) (iter.Seq2[pxb.ModelStreamEvent, error], error) {
 			return runner.ModelStream(ctx, route, req)
 		}
-		return extmodel.New(route.Reg.Name, stream, engine.modelCfg, defs, engine.systemPrompt())
+		inner = extmodel.New(route.Reg.Name, stream, engine.modelCfg, defs, engine.systemPrompt())
+	} else {
+		inner = llmclient.NewClient(engine.modelCfg, engine.hooks, defs, engine.systemPrompt())
 	}
-	return llmclient.NewClient(engine.modelCfg, engine.hooks, defs, engine.systemPrompt())
+	// The same budget wrapper covers builtin HTTP and extension-served models,
+	// so neither path can bypass the session quota. nil budget is a no-op.
+	return budget.NewClient(inner, engine.budget, engine.modelCfg.MaxTokens)
 }
+
+// Budget returns the shared session quota, or nil when unconfigured.
+func (engine *Engine) Budget() *budget.Budget { return engine.budget }
 
 func (engine *Engine) buildToolList(base []tooldef.Tool) []tooldef.Tool {
 	out := engine.buildCoreTools(base)

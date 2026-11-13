@@ -14,6 +14,16 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Optional per-session shared budget (`budget:` block in config.yaml, or
+  `phi run --max-requests` / `--max-output-tokens`). One ledger covers the main
+  agent, concurrent sub-agents, compaction requests and HTTP retries: quota is
+  reserved atomically before dispatch and settled by actual usage. State lives
+  in `~/.phi/budget/<encoded-cwd>/<session-id>.budget.json`, so resuming a
+  session keeps the accumulated spend and switching models never resets it.
+  Exhaustion stops new
+  generation while leaving the conversation resumable; the TUI shows a
+  Copy/Dismiss-only dialog and a footer quota label, while headless runs exit 2
+  and emit `budget` / `kind:"budget_exhausted"` JSONL events.
 - The compaction marker in the transcript now expands to show the summary that
   replaced the cut history. Clicking the marker (or Enter, where the block has
   keyboard focus) reveals it, so a user can check what a compaction dropped

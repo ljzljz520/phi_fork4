@@ -5,6 +5,7 @@ import (
 
 	"github.com/pulseaiclub/xui"
 
+	"github.com/pulseaiclub/phi/internal/budget"
 	"github.com/pulseaiclub/phi/internal/components"
 	"github.com/pulseaiclub/phi/internal/components/chrome"
 	"github.com/pulseaiclub/phi/internal/tui/controller"
@@ -22,10 +23,36 @@ const (
 	errOptDismiss
 )
 
+// budgetOptionLabels is the action set for quota refusal: retrying would hit
+// the same empty ledger, so Retry is deliberately absent.
+var budgetOptionLabels = []string{
+	"Copy to Clipboard",
+	"Dismiss",
+}
+
+const (
+	budgetOptCopy = iota
+	budgetOptDismiss
+)
+
 type errorAskState struct {
-	message  string
+	message string
+	// budget, when set, switches the dialog to budget-exhausted rendering:
+	// distinct title, quota usage lines and the Copy/Dismiss-only action set.
+	budget   *budget.Snapshot
 	selected int
 }
+
+// labels returns the active action set; the keyboard handler indexes into it
+// instead of the ordinary error set so budget mode can never select Retry.
+func (st *errorAskState) labels() []string {
+	if st.budget != nil {
+		return budgetOptionLabels
+	}
+	return errorOptionLabels
+}
+
+func (st *errorAskState) budgetMode() bool { return st.budget != nil }
 
 func errorInnerWidth(width int) int {
 	return max(width-3, 0)
@@ -40,13 +67,25 @@ func (st *errorAskState) wrappedLines(
 		return components.WrapSpans(spans, max(innerW, 1), method)
 	}
 
-	title = wrap(components.Span{Text: "Error", Style: xui.Style{Bold: true, Fg: th.Destructive.Fg}})
+	titleText := "Error"
+	if st.budgetMode() {
+		titleText = "Budget exhausted"
+	}
+	title = wrap(components.Span{Text: titleText, Style: xui.Style{Bold: true, Fg: th.Destructive.Fg}})
 	if st.message != "" {
 		for line := range strings.SplitSeq(st.message, "\n") {
 			message = append(message, wrap(components.Span{Text: line, Style: th.Foreground})...)
 		}
 	}
-	for i, label := range errorOptionLabels {
+	if st.budget != nil {
+		if len(message) > 0 {
+			message = append(message, components.RichLine{})
+		}
+		for _, line := range budgetUsageLines(*st.budget) {
+			message = append(message, wrap(components.Span{Text: line, Style: th.Warning})...)
+		}
+	}
+	for i, label := range st.labels() {
 		options = append(
 			options,
 			chrome.OptionLine(th, th.Destructive, label, i == st.selected, max(innerW, 1), method),
@@ -240,10 +279,10 @@ func (o *Overlays) handleErrorKey(ctx *components.EventContext, e xui.KeyEvent) 
 		if st.selected > 0 {
 			st.selected--
 		} else {
-			st.selected = len(errorOptionLabels) - 1
+			st.selected = len(st.labels()) - 1
 		}
 	case xui.KeyDown, xui.KeyRight, xui.KeyTab:
-		st.selected = (st.selected + 1) % len(errorOptionLabels)
+		st.selected = (st.selected + 1) % len(st.labels())
 	case xui.KeyEnter:
 		o.acceptErrorOption(st.selected)
 	case xui.KeyRune:
@@ -252,17 +291,28 @@ func (o *Overlays) handleErrorKey(ctx *components.EventContext, e xui.KeyEvent) 
 		}
 		switch e.Rune {
 		case 'r', 'R':
-			o.acceptErrorOption(errOptRetry)
+			// Quota refusal is terminal; the budget dialog has no Retry action.
+			if !st.budgetMode() {
+				o.acceptErrorOption(errOptRetry)
+			}
 		case 'c', 'C', 'y', 'Y':
-			o.acceptErrorOption(errOptCopy)
+			if st.budgetMode() {
+				o.acceptErrorOption(budgetOptCopy)
+			} else {
+				o.acceptErrorOption(errOptCopy)
+			}
 		case 'd', 'D', 'n', 'N':
-			o.acceptErrorOption(errOptDismiss)
+			if st.budgetMode() {
+				o.acceptErrorOption(budgetOptDismiss)
+			} else {
+				o.acceptErrorOption(errOptDismiss)
+			}
 		case 'k', 'K', 'h', 'H':
 			if st.selected > 0 {
 				st.selected--
 			}
 		case 'j', 'J', 'l', 'L':
-			st.selected = (st.selected + 1) % len(errorOptionLabels)
+			st.selected = (st.selected + 1) % len(st.labels())
 		}
 	}
 	ctx.ConsumeAndRedraw()
@@ -270,6 +320,15 @@ func (o *Overlays) handleErrorKey(ctx *components.EventContext, e xui.KeyEvent) 
 }
 
 func (o *Overlays) acceptErrorOption(idx int) {
+	st := o.err
+	if st != nil && st.budgetMode() {
+		if idx == budgetOptCopy {
+			o.resolveError(controller.ErrorReply{Copy: true})
+		} else {
+			o.resolveError(controller.ErrorReply{})
+		}
+		return
+	}
 	switch idx {
 	case errOptRetry:
 		o.resolveError(controller.ErrorReply{Retry: true})

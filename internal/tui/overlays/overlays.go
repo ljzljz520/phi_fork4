@@ -85,6 +85,10 @@ func (o *Overlays) Apply(msg controller.OverlayMsg) {
 		o.beginErrorAsk(msg)
 	case controller.OverlayErrorDismiss:
 		o.dismissError()
+	case controller.OverlayBudgetAsk:
+		o.beginBudgetAsk(msg)
+	case controller.OverlayBudgetDismiss:
+		o.dismissError()
 	}
 }
 

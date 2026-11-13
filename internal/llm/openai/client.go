@@ -234,6 +234,7 @@ func CompactRequest(
 			Message      llm.Message `json:"message"`
 			FinishReason string      `json:"finish_reason"`
 		} `json:"choices"`
+		Usage *usageWire `json:"usage,omitempty"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return llm.CompactResult{}, err
@@ -242,10 +243,14 @@ func CompactRequest(
 	if len(resp.Choices) == 0 {
 		return llm.CompactResult{}, errors.New("LLM API error: empty choices")
 	}
-	return llm.CompactResult{
+	result := llm.CompactResult{
 		Text:      resp.Choices[0].Message.Content,
 		Truncated: resp.Choices[0].FinishReason == finishReasonLength,
-	}, nil
+	}
+	if resp.Usage != nil {
+		result.Usage = normalizeUsage(*resp.Usage)
+	}
+	return result, nil
 }
 
 // StreamChatCompletion POSTs a streaming chat completion and yields normalized events.

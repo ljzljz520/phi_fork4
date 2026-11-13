@@ -131,6 +131,26 @@ func TestCompactCollectsText(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "summary", res.Text)
 	assert.False(t, res.Truncated)
+	assert.False(t, res.UsageReported())
+}
+
+func TestCompactCarriesReportedUsage(t *testing.T) {
+	frames := []pxb.ModelStreamEvent{
+		{Type: "delta", Content: "summary"},
+		{Type: "done", UsageJSON: []byte(`{"completion_tokens":42,"prompt_tokens":7,"total_tokens":49}`)},
+	}
+	c := New(
+		"echo",
+		func(context.Context, pxb.ModelInvoke) (iter.Seq2[pxb.ModelStreamEvent, error], error) {
+			return sliceSeq(frames), nil
+		},
+		llm.ModelConfig{}, nil, "",
+	)
+	res, err := c.Compact(t.Context(), llm.CompactRequest{Prompt: "summarize"})
+	require.NoError(t, err)
+	assert.True(t, res.UsageReported())
+	assert.Equal(t, 42, res.Usage.CompletionTokens)
+	assert.Equal(t, 49, res.Usage.TotalTokens)
 }
 
 func TestBuildInvoke(t *testing.T) {

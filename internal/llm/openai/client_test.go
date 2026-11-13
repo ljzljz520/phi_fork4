@@ -1,7 +1,10 @@
 package openai
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -127,4 +130,42 @@ func TestBuildRequestDoesNotInferDeepSeekThinking(t *testing.T) {
 	req := BuildRequest(cfg, "", []llm.Message{{Role: llm.RoleUser, Content: "hi"}}, nil)
 	assert.Nil(t, req.Thinking)
 	assert.Equal(t, "high", req.ReasoningEffort)
+}
+
+func TestCompactRequestCarriesUsage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"choices":[{"message":{"role":"assistant","content":"summary"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":12,"completion_tokens":8,"total_tokens":20,
+				"prompt_tokens_details":{"cached_tokens":2}}
+		}`))
+	}))
+	defer srv.Close()
+
+	cfg := llm.ModelConfig{Name: "gpt-4o", BaseURL: srv.URL, APIKey: "k"}
+	res, err := CompactRequest(
+		context.Background(), srv.Client(), cfg, NewCompactRequest(cfg, "sum", 100),
+	)
+	require.NoError(t, err)
+	assert.True(t, res.UsageReported())
+	assert.Equal(t, 8, res.Usage.CompletionTokens)
+	assert.Equal(t, 10, res.Usage.PromptTokens, "uncached prompt (12 - 2 cached)")
+	assert.Equal(t, 2, res.Usage.CachedTokens())
+	assert.Equal(t, 20, res.Usage.TotalTokens)
+}
+
+func TestCompactRequestWithoutUsageStaysZero(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"summary"},"finish_reason":"stop"}]}`))
+	}))
+	defer srv.Close()
+
+	cfg := llm.ModelConfig{Name: "gpt-4o", BaseURL: srv.URL, APIKey: "k"}
+	res, err := CompactRequest(
+		context.Background(), srv.Client(), cfg, NewCompactRequest(cfg, "sum", 100),
+	)
+	require.NoError(t, err)
+	assert.False(t, res.UsageReported())
 }

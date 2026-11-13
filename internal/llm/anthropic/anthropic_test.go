@@ -479,3 +479,38 @@ func TestCompactRequestHasNoThinking(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw["max_tokens"], &maxTokens))
 	require.Equal(t, 100, maxTokens, "compact must preserve the caller's output cap")
 }
+
+func TestCompactRequestCarriesUsage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"content":[{"type":"text","text":"summary"}],
+			"stop_reason":"end_turn",
+			"usage":{"input_tokens":12,"output_tokens":8,"cache_read_input_tokens":4,"cache_creation_input_tokens":2}
+		}`))
+	}))
+	defer srv.Close()
+
+	cfg := llm.ModelConfig{Name: "claude", BaseURL: srv.URL, APIKey: "k"}
+	res, err := CompactRequest(t.Context(), http.DefaultClient, cfg, NewCompactRequest(cfg.Name, "sum", 100))
+	require.NoError(t, err)
+	assert.True(t, res.UsageReported())
+	assert.Equal(t, 8, res.Usage.CompletionTokens)
+	assert.Equal(t, 12, res.Usage.PromptTokens)
+	assert.Equal(t, 4, res.Usage.CachedTokens())
+	assert.Equal(t, 2, res.Usage.CacheWriteTokens())
+	assert.Equal(t, 26, res.Usage.TotalTokens)
+}
+
+func TestCompactRequestWithoutUsageStaysZero(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"summary"}],"stop_reason":"end_turn"}`))
+	}))
+	defer srv.Close()
+
+	cfg := llm.ModelConfig{Name: "claude", BaseURL: srv.URL, APIKey: "k"}
+	res, err := CompactRequest(t.Context(), http.DefaultClient, cfg, NewCompactRequest(cfg.Name, "sum", 100))
+	require.NoError(t, err)
+	assert.False(t, res.UsageReported())
+}

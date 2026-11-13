@@ -9,6 +9,7 @@ import (
 	"github.com/pulseaiclub/sev/commitmsg"
 	"github.com/pulseaiclub/xui"
 
+	"github.com/pulseaiclub/phi/internal/budget"
 	"github.com/pulseaiclub/phi/internal/components"
 	"github.com/pulseaiclub/phi/internal/components/app"
 	"github.com/pulseaiclub/phi/internal/components/chat"
@@ -68,6 +69,10 @@ type Editor struct {
 	updateHint string
 
 	ctrl *controller.EngineController
+
+	// budgetSnap is the active session's latest quota snapshot, nil when the
+	// session has no budget configured. Drives the footer quota label.
+	budgetSnap *budget.Snapshot
 
 	commands  *commands.CommandRegistry
 	sessions  *commands.SessionCommands
@@ -236,8 +241,19 @@ func (e *Editor) Update(m controller.Msg) {
 			e.activity.Apply(controller.ActivityCancelled)
 		}
 		if msg.ErrorText != "" {
-			e.overlays.Apply(controller.OverlayMsg{Kind: controller.OverlayErrorAsk, ErrorText: msg.ErrorText})
+			if msg.BudgetExhausted {
+				e.overlays.Apply(controller.OverlayMsg{
+					Kind:           controller.OverlayBudgetAsk,
+					ErrorText:      msg.ErrorText,
+					BudgetSnapshot: msg.BudgetSnapshot,
+				})
+			} else {
+				e.overlays.Apply(controller.OverlayMsg{Kind: controller.OverlayErrorAsk, ErrorText: msg.ErrorText})
+			}
 		}
+	case controller.BudgetMsg:
+		e.budgetSnap = msg.Snapshot
+		e.syncStatusSlot()
 	case controller.FooterMsg:
 		e.applyFooterMessage(msg)
 	case controller.ToastMsg:
@@ -327,6 +343,7 @@ func (e *Editor) syncStatusSlot() {
 		Spinner:       e.spin,
 		Usage:         e.transcript.Snapshot().LastUsage(),
 		ContextWindow: e.ctrl.ContextWindow(),
+		Budget:        e.budgetSnap,
 	})
 	if !label.Visible() {
 		e.composer.ClearBottomLeftLabel()

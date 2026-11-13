@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -318,6 +319,80 @@ func TestDoWithRetryStaleConn(t *testing.T) {
 			_ = resp.Body.Close()
 		})
 	}
+}
+
+func TestDoWithRetryInvokesHookBeforeRetries(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := requests.Add(1)
+		if n < 3 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer server.Close()
+
+	var hookAttempts []int
+	ctx := WithRetryHook(t.Context(), func(attempt int) error {
+		hookAttempts = append(hookAttempts, attempt)
+		return nil
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, http.NoBody)
+	require.NoError(t, err)
+
+	resp, err := DoWithRetry(server.Client(), req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	assert.Equal(t, []int{1, 2}, hookAttempts, "hook fires once per retry, never for attempt 0")
+	assert.Equal(t, int32(3), requests.Load())
+}
+
+func TestDoWithRetryHookErrorAbortsRetry(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	stopErr := errors.New("quota stop")
+	ctx := WithRetryHook(t.Context(), func(int) error { return stopErr })
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, http.NoBody)
+	require.NoError(t, err)
+
+	resp, err := DoWithRetry(server.Client(), req)
+	require.ErrorIs(t, err, stopErr)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	assert.Equal(t, int32(1), requests.Load(), "hook refusal prevents the retry dispatch")
+}
+
+func TestDoWithRetryHookCoversStaleConnPath(t *testing.T) {
+	stale := &net.OpError{
+		Op:  "read",
+		Net: "tcp",
+		Err: &os.SyscallError{Syscall: "read", Err: syscall.ECONNRESET},
+	}
+	transport := &scriptedTransport{errs: []error{stale, nil}}
+	client := &http.Client{Transport: transport}
+
+	var hookAttempts []int
+	ctx := WithRetryHook(t.Context(), func(attempt int) error {
+		hookAttempts = append(hookAttempts, attempt)
+		return nil
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://example.test", http.NoBody)
+	require.NoError(t, err)
+
+	resp, err := DoWithRetry(client, req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	assert.Equal(t, []int{1}, hookAttempts)
 }
 
 // scriptedTransport replays one error per RoundTrip. A nil error is 200 OK.

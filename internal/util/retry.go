@@ -16,6 +16,30 @@ import (
 
 const maxHTTPRetryAttempts = 3
 
+// RetryHook runs immediately before a retry attempt is dispatched. The
+// argument is the zero-based attempt index (1 for the first retry). A
+// non-nil error aborts DoWithRetry and is returned to the caller, letting
+// quota guards reject a retry before it hits the network.
+type RetryHook func(attempt int) error
+
+type retryHookKey struct{}
+
+// WithRetryHook attaches hook to ctx so DoWithRetry can call it before each
+// retry. The first attempt never triggers the hook: callers account for it
+// before their initial request.
+func WithRetryHook(ctx context.Context, hook RetryHook) context.Context {
+	if hook == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, retryHookKey{}, hook)
+}
+
+// RetryHookFromContext returns the hook attached with WithRetryHook, or nil.
+func RetryHookFromContext(ctx context.Context) RetryHook {
+	hook, _ := ctx.Value(retryHookKey{}).(RetryHook)
+	return hook
+}
+
 func shouldRetryHTTPStatus(code int) bool {
 	return code == http.StatusTooManyRequests || code >= 500
 }
@@ -125,6 +149,13 @@ func DoWithRetry(client *http.Client, req *http.Request) (*http.Response, error)
 		err  error
 	)
 	for attempt := range maxHTTPRetryAttempts {
+		if attempt > 0 {
+			if hook := RetryHookFromContext(req.Context()); hook != nil {
+				if hookErr := hook(attempt); hookErr != nil {
+					return nil, hookErr
+				}
+			}
+		}
 		if resp != nil {
 			_ = resp.Body.Close()
 			resp = nil

@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/pulseaiclub/phi/internal/agent"
+	"github.com/pulseaiclub/phi/internal/budget"
 	"github.com/pulseaiclub/phi/internal/job"
 	"github.com/pulseaiclub/phi/internal/llm"
 	"github.com/pulseaiclub/phi/internal/session"
@@ -140,6 +141,41 @@ func TestEngineRunnerExplicitPreset(t *testing.T) {
 	default:
 		assert.Fail(t, "child engine did not send a request")
 	}
+}
+
+func TestEngineRunnerSharesParentBudget(t *testing.T) {
+	srv := textOnlySSEServer("done")
+	defer srv.Close()
+
+	shared := budget.New(budget.Limits{MaxRequests: 1, MaxOutputTokens: 100000})
+	runner := agent.EngineRunner{
+		Model:    llm.ModelConfig{Name: "fake", BaseURL: srv.URL, APIKey: "x", MaxTokens: 100},
+		BudgetFn: func() *budget.Budget { return shared },
+	}
+	mgr, err := job.New(job.Options{
+		Root:   t.TempDir(),
+		Runner: runner,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = mgr.Close(t.Context()) })
+
+	first, err := mgr.Spawn(t.Context(), job.SpawnRequest{Prompt: "one", WorkDir: t.TempDir()})
+	require.NoError(t, err)
+	firstRes, err := mgr.Wait(t.Context(), first.ID)
+	require.NoError(t, err)
+	assert.Equal(t, job.StatusCompleted, firstRes.Info.Status)
+	assert.Equal(t, int64(1), shared.Snapshot().SettledRequests)
+	assert.True(t, shared.Snapshot().Exhausted)
+
+	// The second job outlives any single tool call, yet the shared quota
+	// refuses its first request before the network is touched.
+	second, err := mgr.Spawn(t.Context(), job.SpawnRequest{Prompt: "two", WorkDir: t.TempDir()})
+	require.NoError(t, err)
+	secondRes, err := mgr.Wait(t.Context(), second.ID)
+	require.NoError(t, err)
+	assert.Equal(t, job.StatusFailed, secondRes.Info.Status)
+	assert.Contains(t, secondRes.Info.Error, "budget exhausted")
+	assert.Equal(t, int64(1), shared.Snapshot().SettledRequests, "the refused job consumed nothing")
 }
 
 func TestEngineRunnerCancel(t *testing.T) {

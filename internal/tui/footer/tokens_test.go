@@ -83,7 +83,7 @@ func TestJoinBorderPartsBothEmpty(t *testing.T) {
 func TestTokenStatusLabelAmbient(t *testing.T) {
 	th := components.DefaultTheme()
 	u := session.TokenUsage{PromptTokens: 1200, CompletionTokens: 800, TotalTokens: 2000}
-	label := tokenStatusLabel(th, u, 128000)
+	label := tokenStatusLabel(th, u, 128000, nil)
 	assert.Equal(t, ChromeLabelStyle(th), label.Style)
 	assert.Contains(t, label.Text, "↑1.2k")
 	assert.Contains(t, label.Text, "%/128k")
@@ -94,7 +94,7 @@ func TestTokenStatusLabelPressureEscalatesContextOnly(t *testing.T) {
 	th := components.DefaultTheme()
 	// 95% of 100k → danger tier on default window thresholds.
 	u := session.TokenUsage{PromptTokens: 95000, TotalTokens: 95000}
-	label := tokenStatusLabel(th, u, 100000)
+	label := tokenStatusLabel(th, u, 100000, nil)
 	require.NotEmpty(t, label.Spans)
 	assert.Equal(t, ChromeLabelStyle(th), label.Spans[0].Style)
 	assert.Equal(t, th.Destructive, label.Spans[1].Style)

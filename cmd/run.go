@@ -26,7 +26,7 @@ var runCommand = cli.Command{
 stdout (one JSON object per line).
 
 exit codes:
-  0 success   1 runtime/LLM error   3 config/usage`,
+  0 success   1 runtime/LLM error   2 budget exhausted   3 config/usage`,
 	Flags: []cli.Flag{
 		cli.String("prompt", "p", "prompt to run (required)", ""),
 		cli.Bool("jsonl", "", "emit JSONL events to stdout"),
@@ -43,6 +43,18 @@ exit codes:
 		cli.Bool("continue-last", "", "resume the newest persisted session for this directory"),
 		cli.String("session-dir", "", "override the session storage directory", ""),
 		cli.Var("tools", "", "LIST", "enable only these built-in tools (comma-separated)", toolsFlag{}, parseToolsFlag),
+		cli.Int(
+			"max-requests",
+			"",
+			"shared session cap on model requests (0 = unlimited; overrides config budget)",
+			-1,
+		),
+		cli.Int(
+			"max-output-tokens",
+			"",
+			"shared session cap on settled output tokens (0 = unlimited; overrides config budget)",
+			-1,
+		),
 	},
 }
 
@@ -60,13 +72,24 @@ func init() {
 
 func runOptionsFromFlags(f cli.Flags) (runOptions, error) {
 	opts := runOptions{
-		prompt:       f.String("prompt"),
-		jsonl:        f.Bool("jsonl"),
-		yolo:         f.Bool("yolo"),
-		timeout:      f.Duration("timeout"),
-		session:      f.String("session"),
-		continueLast: f.Bool("continue-last"),
-		sessionDir:   f.String("session-dir"),
+		prompt:          f.String("prompt"),
+		jsonl:           f.Bool("jsonl"),
+		yolo:            f.Bool("yolo"),
+		timeout:         f.Duration("timeout"),
+		session:         f.String("session"),
+		continueLast:    f.Bool("continue-last"),
+		sessionDir:      f.String("session-dir"),
+		maxRequests:     f.Int("max-requests"),
+		maxOutputTokens: f.Int("max-output-tokens"),
+	}
+	if opts.maxRequests < -1 {
+		return opts, runCommand.Usagef("--max-requests must be a non-negative integer, got %d", opts.maxRequests)
+	}
+	if opts.maxOutputTokens < -1 {
+		return opts, runCommand.Usagef(
+			"--max-output-tokens must be a non-negative integer, got %d",
+			opts.maxOutputTokens,
+		)
 	}
 	if tf, ok := f["tools"].(toolsFlag); ok && tf.set {
 		opts.builtinTools = tf.raw
